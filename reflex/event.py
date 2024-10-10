@@ -4,27 +4,39 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import sys
 import types
 import urllib.parse
 from base64 import b64encode
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Dict,
     List,
     Optional,
     Tuple,
+    Type,
     Union,
     get_type_hints,
 )
 
+from typing_extensions import get_args, get_origin
+
 from reflex import constants
-from reflex.utils import format
+from reflex.utils import console, format
 from reflex.utils.exceptions import EventFnArgMismatch, EventHandlerArgMismatch
-from reflex.utils.types import ArgsSpec
+from reflex.utils.types import ArgsSpec, GenericType
 from reflex.vars import VarData
-from reflex.vars.base import LiteralVar, Var
-from reflex.vars.function import FunctionStringVar, FunctionVar
+from reflex.vars.base import (
+    CachedVarOperation,
+    LiteralNoneVar,
+    LiteralVar,
+    ToOperation,
+    Var,
+    cached_property_no_lock,
+)
+from reflex.vars.function import ArgsFunctionOperation, FunctionStringVar, FunctionVar
 from reflex.vars.object import ObjectVar
 
 try:
@@ -373,7 +385,7 @@ class CallableEventSpec(EventSpec):
 class EventChain(EventActionsMixin):
     """Container for a chain of events that will be executed in order."""
 
-    events: List[EventSpec] = dataclasses.field(default_factory=list)
+    events: List[Union[EventSpec, EventVar]] = dataclasses.field(default_factory=list)
 
     args_spec: Optional[Callable] = dataclasses.field(default=None)
 
@@ -387,23 +399,63 @@ prevent_default = EventChain(events=[], args_spec=lambda: []).prevent_default
     init=True,
     frozen=True,
 )
-class Target:
-    """A Javascript event target."""
+class JavascriptHTMLInputElement:
+    """Interface for a Javascript HTMLInputElement https://developer.mozilla.org/en-US/docs/Web/API/HTMLInputElement."""
 
-    checked: bool = False
-    value: Any = None
+    value: str = ""
 
 
 @dataclasses.dataclass(
     init=True,
     frozen=True,
 )
-class FrontendEvent:
-    """A Javascript event."""
+class JavascriptInputEvent:
+    """Interface for a Javascript InputEvent https://developer.mozilla.org/en-US/docs/Web/API/InputEvent."""
 
-    target: Target = Target()
+    target: JavascriptHTMLInputElement = JavascriptHTMLInputElement()
+
+
+@dataclasses.dataclass(
+    init=True,
+    frozen=True,
+)
+class JavasciptKeyboardEvent:
+    """Interface for a Javascript KeyboardEvent https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent."""
+
     key: str = ""
-    value: Any = None
+
+
+def input_event(e: Var[JavascriptInputEvent]) -> Tuple[str]:
+    """Get the value from an input event.
+
+    Args:
+        e: The input event.
+
+    Returns:
+        The value from the input event.
+    """
+    return (e.target.value,)
+
+
+def key_event(e: Var[JavasciptKeyboardEvent]) -> Tuple[str]:
+    """Get the key from a keyboard event.
+
+    Args:
+        e: The keyboard event.
+
+    Returns:
+        The key from the keyboard event.
+    """
+    return (e.key,)
+
+
+def empty_event() -> Tuple[()]:
+    """Empty event handler.
+
+    Returns:
+        An empty tuple.
+    """
+    return tuple()  # type: ignore
 
 
 @dataclasses.dataclass(
@@ -417,7 +469,7 @@ class FileUpload:
     on_upload_progress: Optional[Union[EventHandler, Callable]] = None
 
     @staticmethod
-    def on_upload_progress_args_spec(_prog: Dict[str, Union[int, float, bool]]):
+    def on_upload_progress_args_spec(_prog: Var[Dict[str, Union[int, float, bool]]]):
         """Args spec for on_upload_progress event handler.
 
         Returns:
@@ -476,7 +528,7 @@ class FileUpload:
             if isinstance(events, Var):
                 raise ValueError(f"{on_upload_progress} cannot return a var {events}.")
             on_upload_progress_chain = EventChain(
-                events=events,
+                events=[*events],
                 args_spec=self.on_upload_progress_args_spec,
             )
             formatted_chain = str(format.format_prop(on_upload_progress_chain))
@@ -837,6 +889,16 @@ def call_script(
                 ),
             ),
         }
+    if isinstance(javascript_code, str):
+        # When there is VarData, include it and eval the JS code inline on the client.
+        javascript_code, original_code = (
+            LiteralVar.create(javascript_code),
+            javascript_code,
+        )
+        if not javascript_code._get_all_var_data():
+            # Without VarData, cast to string and eval the code in the event loop.
+            javascript_code = str(Var(_js_expr=original_code))
+
     return server_side(
         "_call_script",
         get_fn_signature(call_script),
@@ -910,6 +972,42 @@ def call_event_handler(
         )
 
 
+def unwrap_var_annotation(annotation: GenericType):
+    """Unwrap a Var annotation or return it as is if it's not Var[X].
+
+    Args:
+        annotation: The annotation to unwrap.
+
+    Returns:
+        The unwrapped annotation.
+    """
+    if get_origin(annotation) is Var and (args := get_args(annotation)):
+        return args[0]
+    return annotation
+
+
+def resolve_annotation(annotations: dict[str, Any], arg_name: str):
+    """Resolve the annotation for the given argument name.
+
+    Args:
+        annotations: The annotations.
+        arg_name: The argument name.
+
+    Returns:
+        The resolved annotation.
+    """
+    annotation = annotations.get(arg_name)
+    if annotation is None:
+        console.deprecate(
+            feature_name="Unannotated event handler arguments",
+            reason="Provide type annotations for event handler arguments.",
+            deprecation_version="0.6.3",
+            removal_version="0.7.0",
+        )
+        return JavascriptInputEvent
+    return annotation
+
+
 def parse_args_spec(arg_spec: ArgsSpec):
     """Parse the args provided in the ArgsSpec of an event trigger.
 
@@ -921,20 +1019,54 @@ def parse_args_spec(arg_spec: ArgsSpec):
     """
     spec = inspect.getfullargspec(arg_spec)
     annotations = get_type_hints(arg_spec)
+
     return arg_spec(
         *[
-            Var(f"_{l_arg}").to(annotations.get(l_arg, FrontendEvent))
+            Var(f"_{l_arg}").to(
+                unwrap_var_annotation(resolve_annotation(annotations, l_arg))
+            )
             for l_arg in spec.args
         ]
     )
+
+
+def check_fn_match_arg_spec(fn: Callable, arg_spec: ArgsSpec) -> List[Var]:
+    """Ensures that the function signature matches the passed argument specification
+    or raises an EventFnArgMismatch if they do not.
+
+    Args:
+        fn: The function to be validated.
+        arg_spec: The argument specification for the event trigger.
+
+    Returns:
+        The parsed arguments from the argument specification.
+
+    Raises:
+        EventFnArgMismatch: Raised if the number of mandatory arguments do not match
+    """
+    fn_args = inspect.getfullargspec(fn).args
+    fn_defaults_args = inspect.getfullargspec(fn).defaults
+    n_fn_args = len(fn_args)
+    n_fn_defaults_args = len(fn_defaults_args) if fn_defaults_args else 0
+    if isinstance(fn, types.MethodType):
+        n_fn_args -= 1  # subtract 1 for bound self arg
+    parsed_args = parse_args_spec(arg_spec)
+    if not (n_fn_args - n_fn_defaults_args <= len(parsed_args) <= n_fn_args):
+        raise EventFnArgMismatch(
+            "The number of mandatory arguments accepted by "
+            f"{fn} ({n_fn_args - n_fn_defaults_args}) "
+            "does not match the arguments passed by the event trigger: "
+            f"{[str(v) for v in parsed_args]}\n"
+            "See https://reflex.dev/docs/events/event-arguments/"
+        )
+    return parsed_args
 
 
 def call_event_fn(fn: Callable, arg_spec: ArgsSpec) -> list[EventSpec] | Var:
     """Call a function to a list of event specs.
 
     The function should return a single EventSpec, a list of EventSpecs, or a
-    single Var. The function signature must match the passed arg_spec or
-    EventFnArgsMismatch will be raised.
+    single Var.
 
     Args:
         fn: The function to call.
@@ -944,7 +1076,6 @@ def call_event_fn(fn: Callable, arg_spec: ArgsSpec) -> list[EventSpec] | Var:
         The event specs from calling the function or a Var.
 
     Raises:
-        EventFnArgMismatch: If the function signature doesn't match the arg spec.
         EventHandlerValueError: If the lambda returns an unusable value.
     """
     # Import here to avoid circular imports.
@@ -952,19 +1083,7 @@ def call_event_fn(fn: Callable, arg_spec: ArgsSpec) -> list[EventSpec] | Var:
     from reflex.utils.exceptions import EventHandlerValueError
 
     # Check that fn signature matches arg_spec
-    fn_args = inspect.getfullargspec(fn).args
-    n_fn_args = len(fn_args)
-    if isinstance(fn, types.MethodType):
-        n_fn_args -= 1  # subtract 1 for bound self arg
-    parsed_args = parse_args_spec(arg_spec)
-    if len(parsed_args) != n_fn_args:
-        raise EventFnArgMismatch(
-            "The number of arguments accepted by "
-            f"{fn} ({n_fn_args}) "
-            "does not match the arguments passed by the event trigger: "
-            f"{[str(v) for v in parsed_args]}\n"
-            "See https://reflex.dev/docs/events/event-arguments/"
-        )
+    parsed_args = check_fn_match_arg_spec(fn, arg_spec)
 
     # Call the function with the parsed args.
     out = fn(*parsed_args)
@@ -1025,6 +1144,9 @@ def fix_events(
         token: The user token.
         router_data: The optional router data to set in the event.
 
+    Raises:
+        ValueError: If the event type is not what was expected.
+
     Returns:
         The fixed events.
     """
@@ -1048,7 +1170,8 @@ def fix_events(
         # Otherwise, create an event from the event spec.
         if isinstance(e, EventHandler):
             e = e()
-        assert isinstance(e, EventSpec), f"Unexpected event type, {type(e)}."
+        if not isinstance(e, EventSpec):
+            raise ValueError(f"Unexpected event type, {type(e)}.")
         name = format.format_event_handler(e.handler)
         payload = {k._js_expr: v._decode() for k, v in e.args}  # type: ignore
 
@@ -1085,3 +1208,178 @@ def get_fn_signature(fn: Callable) -> inspect.Signature:
         "state", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Any
     )
     return signature.replace(parameters=(new_param, *signature.parameters.values()))
+
+
+class EventVar(ObjectVar):
+    """Base class for event vars."""
+
+
+@dataclasses.dataclass(
+    eq=False,
+    frozen=True,
+    **{"slots": True} if sys.version_info >= (3, 10) else {},
+)
+class LiteralEventVar(CachedVarOperation, LiteralVar, EventVar):
+    """A literal event var."""
+
+    _var_value: EventSpec = dataclasses.field(default=None)  # type: ignore
+
+    def __hash__(self) -> int:
+        """Get the hash of the var.
+
+        Returns:
+            The hash of the var.
+        """
+        return hash((self.__class__.__name__, self._js_expr))
+
+    @cached_property_no_lock
+    def _cached_var_name(self) -> str:
+        """The name of the var.
+
+        Returns:
+            The name of the var.
+        """
+        return str(
+            FunctionStringVar("Event").call(
+                # event handler name
+                ".".join(
+                    filter(
+                        None,
+                        format.get_event_handler_parts(self._var_value.handler),
+                    )
+                ),
+                # event handler args
+                {str(name): value for name, value in self._var_value.args},
+                # event actions
+                self._var_value.event_actions,
+                # client handler name
+                *(
+                    [self._var_value.client_handler_name]
+                    if self._var_value.client_handler_name
+                    else []
+                ),
+            )
+        )
+
+    @classmethod
+    def create(
+        cls,
+        value: EventSpec,
+        _var_data: VarData | None = None,
+    ) -> LiteralEventVar:
+        """Create a new LiteralEventVar instance.
+
+        Args:
+            value: The value of the var.
+            _var_data: The data of the var.
+
+        Returns:
+            The created LiteralEventVar instance.
+        """
+        return cls(
+            _js_expr="",
+            _var_type=EventSpec,
+            _var_data=_var_data,
+            _var_value=value,
+        )
+
+
+class EventChainVar(FunctionVar):
+    """Base class for event chain vars."""
+
+
+@dataclasses.dataclass(
+    eq=False,
+    frozen=True,
+    **{"slots": True} if sys.version_info >= (3, 10) else {},
+)
+class LiteralEventChainVar(CachedVarOperation, LiteralVar, EventChainVar):
+    """A literal event chain var."""
+
+    _var_value: EventChain = dataclasses.field(default=None)  # type: ignore
+
+    def __hash__(self) -> int:
+        """Get the hash of the var.
+
+        Returns:
+            The hash of the var.
+        """
+        return hash((self.__class__.__name__, self._js_expr))
+
+    @cached_property_no_lock
+    def _cached_var_name(self) -> str:
+        """The name of the var.
+
+        Returns:
+            The name of the var.
+        """
+        sig = inspect.signature(self._var_value.args_spec)  # type: ignore
+        if sig.parameters:
+            arg_def = tuple((f"_{p}" for p in sig.parameters))
+            arg_def_expr = LiteralVar.create([Var(_js_expr=arg) for arg in arg_def])
+        else:
+            # add a default argument for addEvents if none were specified in value.args_spec
+            # used to trigger the preventDefault() on the event.
+            arg_def = ("...args",)
+            arg_def_expr = Var(_js_expr="args")
+
+        return str(
+            ArgsFunctionOperation.create(
+                arg_def,
+                FunctionStringVar.create("addEvents").call(
+                    LiteralVar.create(
+                        [LiteralVar.create(event) for event in self._var_value.events]
+                    ),
+                    arg_def_expr,
+                    self._var_value.event_actions,
+                ),
+            )
+        )
+
+    @classmethod
+    def create(
+        cls,
+        value: EventChain,
+        _var_data: VarData | None = None,
+    ) -> LiteralEventChainVar:
+        """Create a new LiteralEventChainVar instance.
+
+        Args:
+            value: The value of the var.
+            _var_data: The data of the var.
+
+        Returns:
+            The created LiteralEventChainVar instance.
+        """
+        return cls(
+            _js_expr="",
+            _var_type=EventChain,
+            _var_data=_var_data,
+            _var_value=value,
+        )
+
+
+@dataclasses.dataclass(
+    eq=False,
+    frozen=True,
+    **{"slots": True} if sys.version_info >= (3, 10) else {},
+)
+class ToEventVarOperation(ToOperation, EventVar):
+    """Result of a cast to an event var."""
+
+    _original: Var = dataclasses.field(default_factory=lambda: LiteralNoneVar.create())
+
+    _default_var_type: ClassVar[Type] = EventSpec
+
+
+@dataclasses.dataclass(
+    eq=False,
+    frozen=True,
+    **{"slots": True} if sys.version_info >= (3, 10) else {},
+)
+class ToEventChainVarOperation(ToOperation, EventChainVar):
+    """Result of a cast to an event chain var."""
+
+    _original: Var = dataclasses.field(default_factory=lambda: LiteralNoneVar.create())
+
+    _default_var_type: ClassVar[Type] = EventChain

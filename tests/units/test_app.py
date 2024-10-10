@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import functools
 import io
 import json
@@ -766,7 +765,8 @@ async def test_upload_file(tmp_path, state, delta, token: str, mocker):
     )
     state._tmp_path = tmp_path
     # The App state must be the "root" of the state tree
-    app = App(state=State)
+    app = App()
+    app._enable_state()
     app.event_namespace.emit = AsyncMock()  # type: ignore
     current_state = await app.state_manager.get_state(_substate_key(token, state))
     data = b"This is binary data"
@@ -1053,7 +1053,7 @@ async def test_dynamic_route_var_route_change_completed_on_load(
                     f"comp_{arg_name}": exp_val,
                     constants.CompileVars.IS_HYDRATED: False,
                     # "side_effect_counter": exp_index,
-                    "router": dataclasses.asdict(exp_router),
+                    "router": exp_router,
                 }
             },
             events=[

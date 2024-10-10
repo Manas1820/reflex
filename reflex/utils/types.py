@@ -9,6 +9,7 @@ import sys
 import types
 from functools import cached_property, lru_cache, wraps
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     ClassVar,
@@ -96,8 +97,22 @@ PrimitiveType = Union[int, float, bool, str, list, dict, set, tuple]
 StateVar = Union[PrimitiveType, Base, None]
 StateIterVar = Union[list, set, tuple]
 
-# ArgsSpec = Callable[[Var], list[Var]]
-ArgsSpec = Callable
+if TYPE_CHECKING:
+    from reflex.vars.base import Var
+
+    # ArgsSpec = Callable[[Var], list[Var]]
+    ArgsSpec = (
+        Callable[[], List[Var]]
+        | Callable[[Var], List[Var]]
+        | Callable[[Var, Var], List[Var]]
+        | Callable[[Var, Var, Var], List[Var]]
+        | Callable[[Var, Var, Var, Var], List[Var]]
+        | Callable[[Var, Var, Var, Var, Var], List[Var]]
+        | Callable[[Var, Var, Var, Var, Var, Var], List[Var]]
+        | Callable[[Var, Var, Var, Var, Var, Var, Var], List[Var]]
+    )
+else:
+    ArgsSpec = Callable[..., List[Any]]
 
 
 PrimitiveToAnnotation = {
@@ -359,7 +374,7 @@ def get_base_class(cls: GenericType) -> Type:
     if is_literal(cls):
         # only literals of the same type are supported.
         arg_type = type(get_args(cls)[0])
-        if not all(type(arg) == arg_type for arg in get_args(cls)):
+        if not all(type(arg) is arg_type for arg in get_args(cls)):
             raise TypeError("only literals of the same type are supported")
         return type(get_args(cls)[0])
 
@@ -523,7 +538,7 @@ def is_backend_base_variable(name: str, cls: Type) -> bool:
 
     if name in cls.__dict__:
         value = cls.__dict__[name]
-        if type(value) == classmethod:
+        if type(value) is classmethod:
             return False
         if callable(value):
             return False

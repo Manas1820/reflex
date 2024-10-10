@@ -114,9 +114,6 @@ def _init(
             app_name, generation_hash=generation_hash
         )
 
-    # Migrate Pynecone projects to Reflex.
-    prerequisites.migrate_to_reflex()
-
     # Initialize the .gitignore.
     prerequisites.initialize_gitignore()
 
@@ -229,7 +226,8 @@ def _run(
             exec.run_frontend_prod,
             exec.run_backend_prod,
         )
-    assert setup_frontend and frontend_cmd and backend_cmd, "Invalid env"
+    if not setup_frontend or not frontend_cmd or not backend_cmd:
+        raise ValueError("Invalid env")
 
     # Post a telemetry event.
     telemetry.send(f"run-{env.value}")
@@ -247,13 +245,23 @@ def _run(
 
     # In prod mode, run the backend on a separate thread.
     if backend and env == constants.Env.PROD:
-        commands.append((backend_cmd, backend_host, backend_port, loglevel, frontend))
+        commands.append(
+            (
+                backend_cmd,
+                backend_host,
+                backend_port,
+                loglevel.subprocess_level(),
+                frontend,
+            )
+        )
 
     # Start the frontend and backend.
     with processes.run_concurrently_context(*commands):
         # In dev mode, run the backend on the main thread.
         if backend and env == constants.Env.DEV:
-            backend_cmd(backend_host, int(backend_port), loglevel, frontend)
+            backend_cmd(
+                backend_host, int(backend_port), loglevel.subprocess_level(), frontend
+            )
             # The windows uvicorn bug workaround
             # https://github.com/reflex-dev/reflex/issues/2335
             if constants.IS_WINDOWS and exec.frontend_process:
@@ -325,7 +333,7 @@ def export(
         backend=backend,
         zip_dest_dir=zip_dest_dir,
         upload_db_file=upload_db_file,
-        loglevel=loglevel,
+        loglevel=loglevel.subprocess_level(),
     )
 
 
@@ -560,7 +568,7 @@ def deploy(
             frontend=frontend,
             backend=backend,
             zipping=zipping,
-            loglevel=loglevel,
+            loglevel=loglevel.subprocess_level(),
             upload_db_file=upload_db_file,
         ),
         key=key,
@@ -574,7 +582,7 @@ def deploy(
         interactive=interactive,
         with_metrics=with_metrics,
         with_tracing=with_tracing,
-        loglevel=loglevel.value,
+        loglevel=loglevel.subprocess_level(),
     )
 
 
